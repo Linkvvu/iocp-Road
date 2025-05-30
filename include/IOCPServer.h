@@ -26,7 +26,7 @@ public:
   void Stop();
 
   // 获取服务器状态
-  bool IsRunning() const { return running_; }
+  bool IsRunning() const { return running_.load(std::memory_order_acquire); }
 
   // 处理Accept完成
   void HandleAccept(AcceptCtx* ctx);
@@ -34,7 +34,7 @@ public:
   void HandleRecv(IoCtx* ctx);
 
   // TODO:
-  bool HandleError() const;
+  // bool HandleError() const;
 
   // TODO: as private
   bool RemoveIoCtx(const IoCtx* ctx);

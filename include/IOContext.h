@@ -7,7 +7,7 @@
 #include <vector>
 
 #ifndef WSABUF_SIZE
-#define WSABUF_SIZE 1024 * 4 * 2
+  #define WSABUF_SIZE 1024 * 4 * 2
 #endif
 
 #define FMT_ERR_MSG(func, errCode) #func##" failed with error: " + std::to_string(::GetLastError())

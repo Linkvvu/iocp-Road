@@ -2,12 +2,13 @@
 
 #include <Mswsock.h> // 添加Mswsock.h头文件
 #include <algorithm>
+#include <exception>
 #include <iostream>
 #include <log.h>
 
 // 定义SIO_KEEPALIVE_VALS
 #ifndef SIO_KEEPALIVE_VALS
-#define SIO_KEEPALIVE_VALS _WSAIOW(IOC_VENDOR, 4)
+  #define SIO_KEEPALIVE_VALS _WSAIOW(IOC_VENDOR, 4)
 #endif
 
 IOCPServer::IOCPServer(const std::string& address, unsigned short port)
@@ -20,64 +21,74 @@ IOCPServer::IOCPServer(const std::string& address, unsigned short port)
 IOCPServer::~IOCPServer() { Stop(); }
 
 bool IOCPServer::Start() {
-  if (running_) {
-    return true;
-  }
+  try {
+    bool expected = false;
+    if (running_.compare_exchange_strong(expected, true) == false) {
+      return true; // 服务器已启动
+    }
 
-  // 初始化Windows Socket
-  if (!InitializeWinsock()) {
+    // 初始化Windows Socket
+    if (!InitializeWinsock()) {
+      throw std::runtime_error("failed to InitializeWinsock");
+    }
+
+    // 创建完成端口
+    if (!CreateCompletionPort()) {
+      throw std::runtime_error("failed to CreateCompletionPort");
+    }
+
+    // 启动工作线程
+    StartWorkerThreads();
+
+    // 创建监听套接字
+    if (!CreateListenSocket()) {
+      throw std::runtime_error("failed to CreateListenSocket");
+    }
+
+    if (!InitializeExtraFunc()) {
+      throw std::runtime_error("failed to InitializeExtraFunc");
+    }
+
+    // 投递初始Accept请求
+    PreparePostAccept();
+
+  } catch (const std::exception& e) {
+    LOG("failed to start IOCP server, detail: %s", e.what());
+    running_.store(false, std::memory_order_release);
     return false;
   }
 
-  // 创建完成端口
-  if (!CreateCompletionPort()) {
-    return false;
-  }
-
-  // 启动工作线程
-  StartWorkerThreads();
-
-  // 创建监听套接字
-  if (!CreateListenSocket()) {
-    return false;
-  }
-
-  if (!InitializeExtraFunc()) {
-    return false;
-  }
-
-  // 投递初始Accept请求
-  PreparePostAccept();
-
-  running_ = true;
   std::cout << "Server started on " << address_ << ":" << port_ << std::endl;
   return true;
 }
 
 void IOCPServer::Stop() {
   // TODO: use CAP
-  if (!running_) {
-    return;
+  bool expected = true;
+  if (running_.compare_exchange_strong(expected, false) == false) {
+    return; // 服务器已停止
   }
-
-  running_ = false;
 
   // 停止所有工作线程
   for (auto& thread : workerThreads_) {
     thread->Stop();
   }
-  workerThreads_.clear();
 
-  // 关闭所有客户端连接
-  // for (auto& client : clients_) {
-  //   client.second->Close();
-  // }
-  // clients_.clear();
+  for (size_t i = 0; i < workerThreads_.size(); ++i) {
+    ::PostQueuedCompletionStatus(completionPort_, 0, NULL, NULL);
+  }
+
+  workerThreads_.clear();
 
   for (auto& acceptCtx : acceptContexts_) {
     acceptCtx.reset();
   }
   acceptContexts_.clear();
+
+  for (auto& ioCtx : ioContexts_) {
+    ioCtx.reset();
+  }
+  ioContexts_.clear();
 
   // 关闭监听套接字
   if (listenSocket_ != INVALID_SOCKET) {

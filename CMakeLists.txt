@@ -19,15 +19,12 @@ endif()
 set(SOURCES
     src/main.cpp
     src/IOCPServer.cpp
-    # src/SocketContext.cpp
-    # src/IOContext.cpp
     src/WorkerThread.cpp
 )
 
 # 添加头文件
 set(HEADERS
     include/IOCPServer.h
-    # include/SocketContext.h
     include/IOContext.h
     include/WorkerThread.h
 )

@@ -11,26 +11,25 @@ WorkerThread::WorkerThread(IOCPServer& srv, HANDLE completionPort)
     , completionPort_(completionPort)
     , running_(false) {}
 
-WorkerThread::~WorkerThread() { Stop(); }
+WorkerThread::~WorkerThread() {
+  this->Stop();
+  if (thread_.joinable()) {
+    thread_.join();
+  }
+}
 
 void WorkerThread::Start() {
-  if (!running_) {
-    running_ = true;
-    thread_  = std::thread(&WorkerThread::ThreadProc, this);
+  bool expected = false;
+
+  if (running_.compare_exchange_strong(expected, true)) {
+    thread_ = std::thread(&WorkerThread::ThreadProc, this);
   }
 }
 
-void WorkerThread::Stop() {
-  if (running_) {
-    running_ = false;
-    if (thread_.joinable()) {
-      thread_.join();
-    }
-  }
-}
+void WorkerThread::Stop() { running_.store(false, std::memory_order_release); }
 
 void WorkerThread::ThreadProc() {
-  while (running_) {
+  while (running_.load(std::memory_order_acquire)) {
     DWORD bytesTransferred  = 0;
     ULONG_PTR completionKey = 0;
     LPOVERLAPPED overlapped = nullptr;
@@ -42,7 +41,7 @@ void WorkerThread::ThreadProc() {
                                             &overlapped,
                                             INFINITE);
 
-    if (!running_) {
+    if (!running_.load(std::memory_order_acquire)) {
       break;
     }
 
