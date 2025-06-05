@@ -1,4 +1,5 @@
 #include "IOCPServer.h"
+#include "WorkerThread.h"
 
 #include <Mswsock.h> // 添加Mswsock.h头文件
 #include <algorithm>
@@ -63,7 +64,6 @@ bool IOCPServer::Start() {
 }
 
 void IOCPServer::Stop() {
-  // TODO: use CAP
   bool expected = true;
   if (running_.compare_exchange_strong(expected, false) == false) {
     return; // 服务器已停止
@@ -79,16 +79,6 @@ void IOCPServer::Stop() {
   }
 
   workerThreads_.clear();
-
-  for (auto& acceptCtx : acceptContexts_) {
-    acceptCtx.reset();
-  }
-  acceptContexts_.clear();
-
-  for (auto& ioCtx : ioContexts_) {
-    ioCtx.reset();
-  }
-  ioContexts_.clear();
 
   // 关闭监听套接字
   if (listenSocket_ != INVALID_SOCKET) {
@@ -106,17 +96,9 @@ void IOCPServer::Stop() {
   WSACleanup();
 }
 
-bool IOCPServer::RemoveIoCtx(const IoCtx* ctx) {
-  std::lock_guard<std::mutex> guard(ioCtxPoolMutex_);
-  auto it = std::find_if(ioContexts_.begin(),
-                         ioContexts_.end(),
-                         [ctx](const std::unique_ptr<IoCtx>& cur) { return cur.get() == ctx; });
-
-  if (it == ioContexts_.end()) {
-    return false;
-  }
-  ioContexts_.erase(it);
-  return true;
+void IOCPServer::RemoveSession(SOCKET target) {
+  std::lock_guard<std::mutex> guard(sessionsMtx_);
+  sessions_.erase(target);
 }
 
 bool IOCPServer::InitializeWinsock() {
@@ -131,10 +113,10 @@ bool IOCPServer::InitializeWinsock() {
 
 void IOCPServer::PreparePostAccept() {
   for (size_t i = 0; i < MAX_POST_ACCEPT; ++i) {
-    auto ctx = std::make_unique<AcceptCtx>(this->listenSocket_);
-    auto ok  = this->PostAccept(ctx.get());
-    if (ok) {
-      this->acceptContexts_.push_back(std::move(ctx));
+    auto ctx = listenerCxt_->newIoCtx();
+    auto ok  = this->PostAccept(ctx);
+    if (!ok) {
+      listenerCxt_->removeIoCtx(ctx);
     }
   }
 }
@@ -222,6 +204,8 @@ bool IOCPServer::CreateListenSocket() {
     return false;
   }
 
+  listenerCxt_ = std::make_unique<SockCtx>(listenSocket_);
+
   return true;
 }
 
@@ -253,9 +237,9 @@ void IOCPServer::StartWorkerThreads() {
   }
 }
 
-bool IOCPServer::PostAccept(AcceptCtx* ctx) {
+bool IOCPServer::PostAccept(IoCtx* ctx) {
   // 为以后新连入的客户端先准备好Socket
-  ctx->acceptSock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+  ctx->sock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
   if (INVALID_SOCKET == ctx->sock) {
     LOG("WSASocket failed with error: %d", GetLastError());
     return false;
@@ -264,12 +248,13 @@ bool IOCPServer::PostAccept(AcceptCtx* ctx) {
   DWORD bytes;
   WSABUF* pWsaBuf = &ctx->wsaBuf;
   OVERLAPPED* pOl = &ctx->overlapped;
-  BOOL ret        = this->lpfnAcceptEx_(ctx->sock,
-                                 ctx->acceptSock,
+  ctx->op         = OpType::ACCEPT;
+  BOOL ret        = this->lpfnAcceptEx_(listenerCxt_->getSocket(),
+                                 ctx->sock,
                                  pWsaBuf->buf,
-                                 pWsaBuf->len - ((sizeof(SOCKADDR_IN) + 16) * 2),
-                                 sizeof(SOCKADDR_IN) + 16,
-                                 sizeof(SOCKADDR_IN) + 16,
+                                 0,
+                                 sizeof(sockaddr_in) + 16,
+                                 sizeof(sockaddr_in) + 16,
                                  &bytes,
                                  pOl);
   if (ret == FALSE) {
@@ -297,73 +282,69 @@ bool IOCPServer::PostRecv(IoCtx* ctx) {
   return true;
 }
 
-void IOCPServer::HandleAccept(AcceptCtx* ctx) {
-  SOCKADDR_IN* LocalAddr  = NULL;
-  SOCKADDR_IN* ClientAddr = NULL;
-  int remoteLen = sizeof(SOCKADDR_IN), localLen = sizeof(SOCKADDR_IN);
+void IOCPServer::HandleAccept(IoCtx* ctx) {
+  sockaddr_in* LocalAddr  = NULL;
+  sockaddr_in* ClientAddr = NULL;
+  int remoteLen = sizeof(sockaddr_in), localLen = sizeof(sockaddr_in);
   this->lpfnGetAcceptExSockAddrs_(ctx->wsaBuf.buf,
-                                  ctx->wsaBuf.len - ((sizeof(SOCKADDR_IN) + 16) * 2),
-                                  sizeof(SOCKADDR_IN) + 16,
-                                  sizeof(SOCKADDR_IN) + 16,
+                                  0,
+                                  sizeof(sockaddr_in) + 16,
+                                  sizeof(sockaddr_in) + 16,
                                   (LPSOCKADDR*)&LocalAddr,
                                   &localLen,
                                   (LPSOCKADDR*)&ClientAddr,
                                   &remoteLen);
+  auto session = std::make_shared<Session>(ctx->sock, LocalAddr, ClientAddr);
+  session->setConnectedCallback(onConnected_);
+  session->setMessageCallback(onMessage_);
+  session->setSendCompletedCallback(onSendComp_);
 
-  LOG("客户端 %s:%d 连入.", inet_ntoa(ClientAddr->sin_addr), ntohs(ClientAddr->sin_port));
-  LOG("客户额 %s:%d 信息：%s",
-      inet_ntoa(ClientAddr->sin_addr),
-      ntohs(ClientAddr->sin_port),
-      ctx->wsaBuf.buf);
-
-  if (HandleClientConnection(ctx->acceptSock) == false) {
-    LOG("HandleClientConnection failed with error: %d", GetLastError());
+  bool ok = this->AssociateWithIOCP(ctx->sock, 0);
+  if (!ok) {
+    LOG("AssociateWithIOCP failed with error: %d", GetLastError());
     return;
   }
 
-  // FIXME:
-  ctx->ResetBuffer();
-  ctx->ResetAcceptSocket();
-  if (this->PostAccept(ctx) == false) {
-    auto it =
-        std::find_if(acceptContexts_.begin(),
-                     acceptContexts_.end(),
-                     [ctx](const std::unique_ptr<AcceptCtx>& ptr) { return ptr.get() == ctx; });
-    if (it != acceptContexts_.end()) {
-      this->acceptContexts_.erase(it);
-    }
+  session->handleConnected();
 
+  auto newIoCtx = session->getSockCtx()->newIoCtx();
+  ok            = this->PostRecv(newIoCtx);
+  if (!ok) {
+    LOG("PostRecv failed with error: %d", GetLastError());
+    session->getSockCtx()->removeIoCtx(newIoCtx);
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> guard(this->sessionsMtx_);
+    sessions_.insert({ctx->sock, std::move(session)});
+  }
+
+  // post accept again
+  ctx->ResetBuffer();
+  ok = this->PostAccept(ctx);
+  if (!ok) {
     LOG("PostAccept failed");
+    listenerCxt_->removeIoCtx(ctx);
     return;
   }
 }
 
-void IOCPServer::HandleRecv(IoCtx* ctx) {
-
-  LOG("收到信息：%s", ctx->wsaBuf.buf);
-
-  // 然后开始投递下一个WSARecv请求
+void IOCPServer::HandleRecv(std::shared_ptr<Session> session, IoCtx* ctx, size_t recvBytes) {
+  session->handleRecv(ctx->buffer.data(), recvBytes);
   PostRecv(ctx);
 }
 
-bool IOCPServer::HandleClientConnection(SOCKET clientSocket) {
-  auto newIoCtx = std::make_unique<IoCtx>(clientSocket);
-
-  // 将客户端套接字关联到完成端口
-  if (this->AssociateWithIOCP(clientSocket, NULL) == false) {
-    LOG("CreateIoCompletionPort failed with error: %d", GetLastError());
-    return false;
+void IOCPServer::HandleSend(std::shared_ptr<Session> session, IoCtx* ctx, size_t writtenBytes) {
+  size_t needBytes = ctx->buffer.size();
+  if (writtenBytes < needBytes) {
+    session->handleSendUncompleted(ctx, writtenBytes);
+    return;
   }
+  session->handleSendCompleted(ctx);
+}
 
-  // 创建新的IoCtx
-  if (PostRecv(newIoCtx.get()) == false) {
-    return false;
-  }
-
-  std::lock_guard<std::mutex> guard(ioCtxPoolMutex_);
-  // 存储IoCtx,保证Tcp连接生命周期
-  ioContexts_.push_back(std::move(newIoCtx));
-
-  // TODO：储存客户端的相关信息
-  return true;
+std::shared_ptr<Session> IOCPServer::getSession(SOCKET sock) const {
+  std::lock_guard<std::mutex> guard(sessionsMtx_);
+  return sessions_.at(sock);
 }

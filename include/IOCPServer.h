@@ -1,7 +1,6 @@
 #pragma once
 
-#include "IOContext.h"
-#include "WorkerThread.h"
+#include "Session.h"
 
 #include <memory>
 #include <mswsock.h>
@@ -13,11 +12,18 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+class WorkerThread;
+
 // IOCP服务器类，实现基于IOCP的Echo服务器
 class IOCPServer {
 public:
   IOCPServer(const std::string& address, unsigned short port);
+
   ~IOCPServer();
+
+  void setConnectedCallback(onConnectedCallback cb) { onConnected_ = cb; }
+  void setMessageCallback(onMessageCallback cb) { onMessage_ = cb; }
+  void setSendCompletedCallback(onSendCompletedCallback cb) { onSendComp_ = cb; }
 
   // 启动服务器
   bool Start();
@@ -29,15 +35,19 @@ public:
   bool IsRunning() const { return running_.load(std::memory_order_acquire); }
 
   // 处理Accept完成
-  void HandleAccept(AcceptCtx* ctx);
+  void HandleAccept(IoCtx* ctx);
 
-  void HandleRecv(IoCtx* ctx);
+  void HandleRecv(std::shared_ptr<Session> session, IoCtx* ctx, size_t len);
+
+  void HandleSend(std::shared_ptr<Session> session, IoCtx* ctx, size_t writenBytes);
+
+  std::shared_ptr<Session> getSession(SOCKET sock) const;
 
   // TODO:
   // bool HandleError() const;
 
   // TODO: as private
-  bool RemoveIoCtx(const IoCtx* ctx);
+  void RemoveSession(SOCKET target);
 
 private:
   // 初始化Windows Socket
@@ -60,28 +70,28 @@ private:
   void StartWorkerThreads();
 
   // 投递Accept请求
-  bool PostAccept(AcceptCtx* ctx);
+  bool PostAccept(IoCtx* ctx);
 
   bool PostRecv(IoCtx* ctx);
-
-  // 处理客户端连接
-  bool HandleClientConnection(SOCKET clientSocket);
 
   // 清理资源
   void Cleanup();
 
-  std::string address_;                                      // 服务器地址
-  unsigned short port_;                                      // 服务器端口
-  SOCKET listenSocket_;                                      // 监听套接字
-  HANDLE completionPort_;                                    // 完成端口句柄
-  std::vector<std::unique_ptr<WorkerThread>> workerThreads_; // 工作线程池
-  std::atomic<bool> running_;                                // 服务器运行标志
-  static const size_t MAX_WORKER_THREADS = 4;                // 工作线程数量
-  static const size_t MAX_POST_ACCEPT    = 10;               // 最大Accept上下文数量
-  // std::unordered_map<SOCKET, std::unique_ptr<SocketCtx>> clients_;
-  std::vector<std::unique_ptr<AcceptCtx>> acceptContexts_; // Accept上下文池
-  std::vector<std::unique_ptr<IoCtx>> ioContexts_;         // Io上下文池
-  std::mutex ioCtxPoolMutex_;                              // Io上下文池
+  std::string address_;                                           // 服务器地址
+  unsigned short port_;                                           // 服务器端口
+  SOCKET listenSocket_;                                           // 监听套接字
+  HANDLE completionPort_;                                         // 完成端口句柄
+  std::vector<std::unique_ptr<WorkerThread>> workerThreads_;      // 工作线程池
+  std::atomic<bool> running_;                                     // 服务器运行标志
+  static const size_t MAX_WORKER_THREADS = 4;                     // 工作线程数量
+  static const size_t MAX_POST_ACCEPT    = 10;                    // 最大Accept上下文数量
+  std::unique_ptr<SockCtx> listenerCxt_;                          // Accept上下文池
+  std::unordered_map<SOCKET, std::shared_ptr<Session>> sessions_; // Client session pool
+  mutable std::mutex sessionsMtx_;                                // mutex for sessions
   LPFN_ACCEPTEX lpfnAcceptEx_{};
   LPFN_GETACCEPTEXSOCKADDRS lpfnGetAcceptExSockAddrs_{};
+
+  onConnectedCallback onConnected_{};
+  onMessageCallback onMessage_{};
+  onSendCompletedCallback onSendComp_{};
 };

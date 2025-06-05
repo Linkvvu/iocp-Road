@@ -2,10 +2,27 @@
 #include <iostream>
 #include <string>
 
+void onConnected(shared_session_ptr session) {
+  std::printf("new clien: localaddr[%s] - reomteaddr[%s]\n",
+              session->getLocalAddr().c_str(),
+              session->getRemoteAddr().c_str());
+}
+
+void onMessage(shared_session_ptr session, Buffer* buffer) {
+  std::string msg(buffer->peek(), buffer->readableBytes());
+  buffer->retrieve(buffer->readableBytes());
+  std::printf("recv clien[%s] msg: %s\n", session->getRemoteAddr().c_str(), msg.c_str());
+
+  // do echo
+  session->send(msg.data(), msg.size());
+}
+
 int main() {
   try {
     // 创建IOCP服务器实例
     IOCPServer server("127.0.0.1", 8888);
+    server.setConnectedCallback(std::bind(onConnected, std::placeholders::_1));
+    server.setMessageCallback(std::bind(onMessage, std::placeholders::_1, std::placeholders::_2));
 
     // 启动服务器
     if (!server.Start()) {

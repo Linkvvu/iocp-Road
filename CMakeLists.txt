@@ -20,13 +20,18 @@ set(SOURCES
     src/main.cpp
     src/IOCPServer.cpp
     src/WorkerThread.cpp
+    src/Session.cpp
 )
 
 # 添加头文件
 set(HEADERS
     include/IOCPServer.h
     include/IOContext.h
+    include/Session.h
     include/WorkerThread.h
+    include/callback.h
+    include/Buffer.h
+    include/log.h
 )
 
 # 创建可执行文件

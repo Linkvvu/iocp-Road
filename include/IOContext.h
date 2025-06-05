@@ -1,8 +1,15 @@
 #pragma once
+#include "Buffer.h"
+#include "callback.h"
 
 #include <WinSock2.h>
 #include <Windows.h>
+#include <atomic>
+#include <cassert>
+#include <deque>
 #include <exception>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -10,13 +17,13 @@
   #define WSABUF_SIZE 1024 * 4 * 2
 #endif
 
-#define FMT_ERR_MSG(func, errCode) #func##" failed with error: " + std::to_string(::GetLastError())
+#define FMT_ERR_MSG(func, errCode) #func##" failed with error: " + std::to_string(errCode)
 
 enum class OpType {
-  Undefine, // placeholader
-  ACCEPT,   // 接受连接操作
-  RECV,     // 接收数据操作
-  SEND,     // 发送数据操作
+  UNDEFINED, // placeholader
+  ACCEPT,    // 接受连接操作
+  RECV,      // 接收数据操作
+  SEND,      // 发送数据操作
 };
 
 struct IoCtx {
@@ -31,14 +38,14 @@ struct IoCtx {
       , sock(INVALID_SOCKET)
       , buffer(WSABUF_SIZE)
       , wsaBuf{static_cast<ULONG>(buffer.size()), buffer.data()}
-      , op(OpType::Undefine) {}
+      , op(OpType::UNDEFINED) {}
 
   explicit IoCtx(SOCKET socket)
       : IoCtx() {
     sock = socket;
   }
 
-  void ResetBuffer() { ZeroMemory(buffer.data(), buffer.size()); }
+  void ResetBuffer() { buffer.clear(); }
 
   ~IoCtx() {
     if (sock != INVALID_SOCKET) {
@@ -47,39 +54,45 @@ struct IoCtx {
   }
 };
 
-struct AcceptCtx : public IoCtx {
-  SOCKET acceptSock;
+class SockCtx {
+public:
+  SockCtx(SOCKET sock)
+      : sock_(sock) {}
 
-  AcceptCtx(SOCKET listenSocket)
-      : IoCtx(listenSocket) {
-    this->op   = OpType::ACCEPT;
-    acceptSock = INVALID_SOCKET;
-  }
-
-  AcceptCtx(SOCKET listenSocket, SOCKET acceptSocket)
-      : IoCtx(listenSocket) {
-    this->op         = OpType::ACCEPT;
-    this->acceptSock = acceptSocket;
-  }
-
-  void ResetAcceptSocket() { acceptSock = INVALID_SOCKET; }
-
-  ~AcceptCtx() {
-    if (acceptSock != INVALID_SOCKET) {
-      ::closesocket(acceptSock);
+  ~SockCtx() {
+    sock_ = INVALID_SOCKET;
+    std::lock_guard<std::mutex> guard(mtx_);
+    {
+      for (auto ctx : ioCtxs_) {
+        delete ctx;
+      }
     }
   }
+
+  IoCtx* newIoCtx() {
+    IoCtx* newIoCtx = new IoCtx(sock_);
+    {
+      std::lock_guard<std::mutex> guard(mtx_);
+      ioCtxs_.push_back(newIoCtx);
+    }
+    return newIoCtx;
+  }
+
+  void removeIoCtx(IoCtx* target) {
+    {
+      std::lock_guard<std::mutex> guard(mtx_);
+      auto it = std::find(ioCtxs_.begin(), ioCtxs_.end(), target);
+      if (it != ioCtxs_.end()) {
+        ioCtxs_.erase(it);
+      }
+    }
+    delete target;
+  }
+
+  SOCKET getSocket() const { return sock_; }
+
+private:
+  SOCKET sock_;
+  std::vector<IoCtx*> ioCtxs_;
+  std::mutex mtx_;
 };
-
-// struct SocketCtx {
-//   SOCKET sock;
-
-//   SocketCtx(SOCKET socket)
-//       : sock(socket) {}
-
-//   ~SocketCtx() {
-//     if (sock != INVALID_SOCKET) {
-//       closesocket(sock);
-//     }
-//   }
-// };

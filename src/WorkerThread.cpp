@@ -1,8 +1,8 @@
 #include "WorkerThread.h"
 
 #include "IOCPServer.h"
-#include "IOContext.h"
 #include "log.h"
+
 #include <cassert>
 #include <iostream>
 
@@ -65,14 +65,14 @@ void WorkerThread::HandleCompletion(DWORD bytesTransferred,
       return;
 
     case ERROR_NETNAME_DELETED:
-      srv_.RemoveIoCtx(ctx);
+      srv_.RemoveSession(ctx->sock);
       return;
 
     default:
       // 其他未知错误
       // 记录日志并决定是否继续
       LOG("GetQueuedCompletionStatus failed: %d, close the socket %d", dwError, ctx->sock);
-      srv_.RemoveIoCtx(ctx);
+      srv_.RemoveSession(ctx->sock);
       return;
     }
   }
@@ -80,8 +80,7 @@ void WorkerThread::HandleCompletion(DWORD bytesTransferred,
   // 接收到客户端发送的FIN包
   if ((bytesTransferred == 0) && (ctx->op == OpType::RECV || ctx->op == OpType::SEND)) {
     LOG("socket %d 断开连接", ctx->sock);
-    bool ok = srv_.RemoveIoCtx(ctx);
-    assert(ok);
+    srv_.RemoveSession(ctx->sock);
     return;
   }
 
@@ -89,16 +88,17 @@ void WorkerThread::HandleCompletion(DWORD bytesTransferred,
   switch (ctx->op) {
   case OpType::ACCEPT: {
     // 处理Accept完成
-    AcceptCtx* acceptContext = static_cast<AcceptCtx*>(ctx);
-    // IOCPServer* server       = reinterpret_cast<IOCPServer*>(completionKey);
-    srv_.HandleAccept(acceptContext);
+    srv_.HandleAccept(ctx);
     break;
   }
   case OpType::RECV: {
-    srv_.HandleRecv(ctx);
+    std::shared_ptr<Session> session = srv_.getSession(ctx->sock);
+    srv_.HandleRecv(session, ctx, static_cast<size_t>(bytesTransferred));
     break;
   }
   case OpType::SEND: {
+    std::shared_ptr<Session> session = srv_.getSession(ctx->sock);
+    srv_.HandleSend(session, ctx, static_cast<size_t>(bytesTransferred));
     break;
   }
   default:
